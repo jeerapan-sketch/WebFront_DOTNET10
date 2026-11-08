@@ -1,0 +1,51 @@
+replicaCount: 1
+
+image:
+  repository: 10.80.1.220:8088/accessflow_web/accessflow-web
+  tag: v1.1.4-dev
+  pullPolicy: IfNotPresent
+
+# This Secret must already exist in the target namespace. Keep registry
+# credentials out of Git and rotate them independently from this chart.
+imagePullSecrets:
+  - name: harbor-registry-secret
+
+rolloutRevision: "local"
+
+service:
+  port: 80
+  targetPort: 3000
+
+ingress:
+  enabled: true
+  className: traefik
+  host: accessflow-web-dev.10.80.1.101.sslip.io
+  path: /
+  pathType: Prefix
+
+existingSecret:
+  name: webimportexcel-secret
+  apiProxyTargetKey: NUXT_API_PROXY_TARGET
+  redisPasswordKey: REDIS_PASSWORD
+
+session:
+  cookieName: accessflow.sid
+  # Keep false only while the site is served over HTTP. Change to true with HTTPS.
+  cookieSecure: false
+  idleSeconds: 600
+
+redis:
+  enabled: true
+  image: redis:7.4-alpine
+  serviceName: accessflow-web-redis
+  port: 6379
+  serviceType: ClusterIP
+  nodePort: null
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+
+resources: {}

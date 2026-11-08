@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: accessflow-web-service
+  labels:
+    app: accessflow-web
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  selector:
+    app: accessflow-web
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}

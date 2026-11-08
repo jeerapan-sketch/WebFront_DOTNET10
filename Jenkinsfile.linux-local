@@ -1,0 +1,295 @@
+// Local Linux CI. Paste into a Jenkins Pipeline job; no repository changes required.
+pipeline {
+    agent { label 'linux-dotnet10' }
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    environment {
+        SOURCE_REPOSITORY = 'https://github.com/jeerapan-sketch/WebAPI_DOTNET10.git'
+        SOURCE_BRANCH = 'dev'
+        GIT_CREDENTIAL_ID = 'github-read'
+        GITOPS_CREDENTIAL_ID = 'github-write'
+        BUILD_CONFIGURATION = 'Release'
+        SONAR_PROJECT_KEY = 'WebImportExcel'
+        IMAGE_NAME = 'webimportexcel-local'
+        CI_DOCKER_NETWORK = 'webapi-ci'
+        HARBOR_REGISTRY = 'localhost:15050'
+        HARBOR_IMAGE = 'webimportexcel/webimportexcel'
+        HARBOR_CREDENTIAL_ID = 'harbor-robot'
+        MINIO_ENDPOINT = 'http://minio:9000'
+        MINIO_BUCKET = 'pipeline-results'
+        MINIO_CREDENTIAL_ID = 'minio-reports'
+        MC_EXECUTABLE = '/home/jenkins/agent/tools/mc'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir()
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${env.SOURCE_BRANCH}"]],
+                    userRemoteConfigs: [[
+                        url: env.SOURCE_REPOSITORY,
+                        credentialsId: env.GIT_CREDENTIAL_ID
+                    ]]
+                ])
+                sh 'git log -1 --format="%h %s"'
+            }
+        }
+        stage('Restore') {
+            steps { sh 'dotnet restore WebAPI_DOTNET10.slnx --locked-mode' }
+        }
+        stage('OSV Dependency Scan') {
+            steps {
+                sh '''
+                    set -eu
+                    osv-scanner scan source -r WebImportExcel WebImportExcel.Test --format json --output-file osv-report.json
+                '''
+            }
+            post { always { archiveArtifacts artifacts: 'osv-report.json', allowEmptyArchive: true } }
+        }
+        stage('Build, Test and SonarQube Scan') {
+            steps {
+                withSonarQubeEnv('SonarQube-Local') {
+                    sh '''#!/usr/bin/env bash
+set -euo pipefail
+set +x
+dotnet-sonarscanner begin /k:"$SONAR_PROJECT_KEY" /n:"WebImportExcel" /v:"ci-$BUILD_NUMBER" /d:sonar.host.url="$SONAR_HOST_URL" /d:sonar.token="$SONAR_AUTH_TOKEN" /d:sonar.cs.vscoveragexml.reportsPaths="coverage.xml" /d:sonar.cs.vstest.reportsPaths="TestResults/**/*.trx" /d:sonar.exclusions="tmp/**,.codex-spreadsheet-work/**,publish/**,**/bin/**,**/obj/**,web-portal/**,helm/accessflow-web/**,Jenkinsfile.web,trivy-report.html,**/trivy-report.html" /d:sonar.coverage.exclusions="scripts/**,**/DataAccess/**,**/Authentication/OracleAuthRepository.cs,**/Services/Abatement.cs,**/Services/BaseLog.cs,**/Program.cs,**/Model/**"
+dotnet build WebAPI_DOTNET10.slnx -c "$BUILD_CONFIGURATION" --no-restore --no-incremental
+mongo="fifo-ci-$(cat /proc/sys/kernel/random/uuid)"
+created=false
+pg_created=false
+pg=auth-ci-$(cat /proc/sys/kernel/random/uuid)
+cleanup() {
+    if [ "$created" = true ]; then docker rm -f "$mongo" >/dev/null 2>&1 || true; fi
+    if [ "$pg_created" = true ]; then docker rm -f "$pg" >/dev/null 2>&1 || true; fi
+}
+trap cleanup EXIT
+docker run -d --rm --name "$mongo" --network "$CI_DOCKER_NETWORK" mongo:7.0 --replSet rs0 --bind_ip_all
+created=true
+ready=false
+for attempt in $(seq 1 90); do
+    if docker exec "$mongo" mongosh --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then ready=true; break; fi
+    sleep 1
+done
+[ "$ready" = true ] || { echo 'MongoDB startup timed out'; exit 1; }
+docker exec "$mongo" mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+ready=false
+for attempt in $(seq 1 90); do
+    if docker exec "$mongo" mongosh --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)' >/dev/null 2>&1; then ready=true; break; fi
+    sleep 1
+done
+[ "$ready" = true ] || { echo 'MongoDB replica election timed out'; exit 1; }
+export FIFO_TEST_MONGODB_URI="mongodb://$mongo:27017/?replicaSet=rs0&directConnection=true"
+export MONGODB_TEST_CONNECTION_STRING="$FIFO_TEST_MONGODB_URI"
+# Disposable PostgreSQL for authentication integration tests, separate from app data.
+test_pg_password=$(cat /proc/sys/kernel/random/uuid)
+docker run -d --rm --name "$pg" --network "$CI_DOCKER_NETWORK" -e POSTGRES_PASSWORD="$test_pg_password" -e POSTGRES_DB=auth_tests postgres:17-alpine
+pg_created=true
+pg_ready=false
+for attempt in $(seq 1 90); do
+    if docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres -d auth_tests >/dev/null 2>&1; then pg_ready=true; break; fi
+    sleep 1
+done
+[ "$pg_ready" = true ] || { echo 'PostgreSQL test startup timed out'; exit 1; }
+export POSTGRES_TEST_CONNECTION_STRING="Host=$pg;Port=5432;Database=auth_tests;Username=postgres;Password=$test_pg_password"
+dotnet-coverage collect 'dotnet test WebAPI_DOTNET10.slnx -c Release --no-build --logger trx --results-directory TestResults/coverage' -f xml -o coverage.xml
+python3 - <<'PY'
+import glob, xml.etree.ElementTree as ET
+required=['MongoReplicaSetCommitsStockAndReportTogetherAndRejectsRepeat',
+          'ConcurrentRefreshCannotSpendTheSameTokenTwice',
+          'ConcurrentLoginsRespectSessionLimitIncludingFirstLogin']
+found={name:[] for name in required}
+for path in glob.glob('TestResults/coverage/**/*.trx', recursive=True):
+    for node in ET.parse(path).iter():
+        if node.tag.split('}')[-1]=='UnitTestResult' and node.get('testName') in found:
+            found[node.get('testName')].append(node.get('outcome'))
+for name, outcomes in found.items():
+    if not outcomes or any(result!='Passed' for result in outcomes):
+        raise SystemExit('Required integration test did not pass: '+name+' '+repr(outcomes))
+print('MongoDB and PostgreSQL integration tests passed.')
+PY
+test -s coverage.xml
+dotnet-sonarscanner end /d:sonar.token="$SONAR_AUTH_TOKEN"
+'''
+                }
+            }
+            post { always { archiveArtifacts artifacts: 'coverage.xml,TestResults/**/*.trx', allowEmptyArchive: true } }
+        }
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+        stage('Publish') {
+            steps { sh 'dotnet publish WebImportExcel/WebImportExcel.csproj -c Release --no-build -o publish' }
+        }
+        stage('Docker Build') {
+            steps {
+                sh 'docker build --pull --no-cache --platform linux/amd64 --provenance=false -t "$IMAGE_NAME:ci-$BUILD_NUMBER" .'
+            }
+        }
+        stage('Verify Runtime') {
+            steps { sh 'docker run --rm --entrypoint dotnet "$IMAGE_NAME:ci-$BUILD_NUMBER" --list-runtimes' }
+        }
+        stage('Trivy Scan') {
+            steps {
+                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output trivy-report.json "$IMAGE_NAME:ci-$BUILD_NUMBER"'
+            }
+            post { always { archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true } }
+        }
+        stage('Validate Helm Chart') {
+            steps { sh 'helm lint helm/argoCD/webimportexcel' }
+        }
+        stage('Push to Harbor') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.HARBOR_CREDENTIAL_ID,
+                    usernameVariable: 'HARBOR_USERNAME',
+                    passwordVariable: 'HARBOR_PASSWORD'
+                )]) {
+                    sh '''#!/usr/bin/env bash
+set -euo pipefail
+set +x
+# Use a temporary Docker credential file; remove it even when push fails.
+export DOCKER_CONFIG=$(mktemp -d)
+cleanup_login() {
+    rm -f "$DOCKER_CONFIG/config.json"
+    rmdir "$DOCKER_CONFIG" 2>/dev/null || true
+}
+trap cleanup_login EXIT
+printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" --username "$HARBOR_USERNAME" --password-stdin
+target="$HARBOR_REGISTRY/$HARBOR_IMAGE:ci-$BUILD_NUMBER"
+docker tag "$IMAGE_NAME:ci-$BUILD_NUMBER" "$target"
+docker push "$target"
+printf 'Published image: %s\n' "$target"
+'''
+                }
+            }
+        }
+        stage('Update GitOps Version') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.GITOPS_CREDENTIAL_ID,
+                    usernameVariable: 'GITOPS_USERNAME',
+                    passwordVariable: 'GITOPS_PASSWORD'
+                )]) {
+                    sh 'bash scripts/gitops-writeback.sh'
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                def scanResult = currentBuild.currentResult
+                withEnv(["CI_SCAN_RESULT=${scanResult}"]) {
+                    writeFile file: '.ci-collect-results.py', text: '''import base64
+import datetime
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
+
+out = pathlib.Path('.ci-results')
+out.mkdir(exist_ok=True)
+for name in ('osv-report.json', 'trivy-report.json', 'coverage.xml'):
+    source = pathlib.Path(name)
+    if source.is_file():
+        shutil.copy2(source, out / name)
+for source in pathlib.Path('TestResults').glob('**/*.trx'):
+    destination = out / source
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+def save(name, data):
+    (out / name).write_text(json.dumps(data, indent=2, ensure_ascii=False) + chr(10), encoding='utf-8')
+
+sonar_url = os.environ.get('SONAR_HOST_URL', '').rstrip('/')
+token = os.environ.get('SONAR_AUTH_TOKEN', '')
+def sonar_get(path):
+    req = urllib.request.Request(sonar_url + path)
+    req.add_header('Authorization', 'Basic ' + base64.b64encode((token + ':').encode()).decode())
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.load(response)
+
+sonar_export = {'status': 'no_analysis_task_for_this_build'}
+task_files = list(pathlib.Path('.sonarqube').glob('**/report-task.txt'))
+if task_files:
+    shutil.copy2(task_files[0], out / 'sonarqube-report-task.txt')
+    if not token:
+        sonar_export['status'] = 'export_credentials_unavailable'
+if task_files and sonar_url and token:
+    properties = dict(line.split('=', 1) for line in task_files[0].read_text().splitlines() if '=' in line)
+    task_id = properties.get('ceTaskId')
+    if task_id:
+        try:
+            task = sonar_get('/api/ce/task?' + urllib.parse.urlencode({'id': task_id}))
+            save('sonarqube-task.json', task)
+            analysis_id = task.get('task', {}).get('analysisId')
+            sonar_export = {'task_id': task_id, 'analysis_id': analysis_id, 'status': task.get('task', {}).get('status')}
+            if analysis_id:
+                gate = sonar_get('/api/qualitygates/project_status?' + urllib.parse.urlencode({'analysisId': analysis_id}))
+                save('sonarqube-quality-gate.json', gate)
+                metrics = sonar_get('/api/measures/component?' + urllib.parse.urlencode({'component': os.environ['SONAR_PROJECT_KEY'], 'metricKeys': 'coverage,duplicated_lines_density,ncloc,violations'}))
+                save('sonarqube-measures.json', metrics)
+        except (urllib.error.URLError, ValueError, TimeoutError) as exc:
+            sonar_export['export_error'] = type(exc).__name__
+            sonar_export['http_status'] = getattr(exc, 'code', None)
+try:
+    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True, stderr=subprocess.DEVNULL).strip()
+except (subprocess.CalledProcessError, FileNotFoundError):
+    commit = None
+save('build-summary.json', {
+    'job': os.environ.get('JOB_NAME'),
+    'build_number': os.environ.get('BUILD_NUMBER'),
+    'build_url': os.environ.get('BUILD_URL'),
+    'result': os.environ.get('CI_SCAN_RESULT'),
+    'git_commit': commit,
+    'exported_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'sonarqube': sonar_export,
+    'files': sorted(str(p.relative_to(out)) for p in out.rglob('*') if p.is_file()),
+    'note': 'SonarQube gate is tied to analysis_id; component measures are a snapshot at export time. Missing reports indicate stages that did not complete.'
+})
+print('Collected pipeline reports in .ci-results')
+'''
+                    withSonarQubeEnv(installationName: 'SonarQube-Local', envOnly: true) {
+                        sh 'python3 .ci-collect-results.py'
+                    }
+                    archiveArtifacts artifacts: '.ci-results/**/*', allowEmptyArchive: false
+                    withCredentials([usernamePassword(
+                        credentialsId: env.MINIO_CREDENTIAL_ID,
+                        usernameVariable: 'MINIO_ACCESS_KEY',
+                        passwordVariable: 'MINIO_SECRET_KEY'
+                    )]) {
+                        sh '''#!/usr/bin/env bash
+set -euo pipefail
+set +x
+# Credentials remain in the process environment, never in the source or command arguments.
+export MC_HOST_ci=$(python3 - <<'PY'
+import os, urllib.parse
+p=urllib.parse.urlsplit(os.environ['MINIO_ENDPOINT'])
+u=urllib.parse.quote(os.environ['MINIO_ACCESS_KEY'], safe='')
+s=urllib.parse.quote(os.environ['MINIO_SECRET_KEY'], safe='')
+print(urllib.parse.urlunsplit((p.scheme, u+':'+s+'@'+p.netloc, p.path, p.query, p.fragment)))
+PY
+)
+"$MC_EXECUTABLE" cp --recursive .ci-results/ "ci/$MINIO_BUCKET/$JOB_NAME/$BUILD_NUMBER/"
+printf 'Scan reports stored in MinIO: %s/%s/%s/\n' "$MINIO_BUCKET" "$JOB_NAME" "$BUILD_NUMBER"
+'''
+                    }
+                }
+            }
+        }
+        success { echo 'Local CI passed: OSV, build/tests/coverage, SonarQube Quality Gate, Docker image, Trivy and Helm. Image published to Harbor.' }
+        failure { echo 'CI stopped at a failed check. Open the failed stage in Console Output.' }
+    }
+}

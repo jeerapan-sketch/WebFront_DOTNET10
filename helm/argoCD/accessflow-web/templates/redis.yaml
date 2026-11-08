@@ -1,0 +1,108 @@
+{{- if .Values.redis.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.redis.serviceName }}
+  labels:
+    app: {{ .Values.redis.serviceName }}
+    app.kubernetes.io/name: {{ .Values.redis.serviceName }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.redis.serviceName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.redis.serviceName }}
+        app.kubernetes.io/name: {{ .Values.redis.serviceName }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ['/bin/sh', '-c']
+          args:
+            - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret.name | quote }}
+                  key: {{ .Values.existingSecret.redisPasswordKey | quote }}
+          ports:
+            - name: redis
+              containerPort: {{ .Values.redis.port }}
+          readinessProbe:
+            exec:
+              command: ['/bin/sh', '-c', 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping']
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ['/bin/sh', '-c', 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping']
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          {{- if .Values.redis.persistence.enabled }}
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+          {{- end }}
+      {{- if .Values.redis.persistence.enabled }}
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.redis.serviceName }}-data
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.redis.serviceName }}
+  labels:
+    app: {{ .Values.redis.serviceName }}
+    app.kubernetes.io/name: {{ .Values.redis.serviceName }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  type: {{ .Values.redis.serviceType }}
+  selector:
+    app: {{ .Values.redis.serviceName }}
+  ports:
+    - name: redis
+      port: {{ .Values.redis.port }}
+      targetPort: redis
+      {{- if and (eq .Values.redis.serviceType "NodePort") .Values.redis.nodePort }}
+      nodePort: {{ .Values.redis.nodePort }}
+      {{- end }}
+{{- if .Values.redis.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.redis.serviceName }}-data
+  labels:
+    app: {{ .Values.redis.serviceName }}
+    app.kubernetes.io/name: {{ .Values.redis.serviceName }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  accessModes:
+    {{- toYaml .Values.redis.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size }}
+  {{- if .Values.redis.persistence.storageClassName }}
+  storageClassName: {{ .Values.redis.persistence.storageClassName | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}

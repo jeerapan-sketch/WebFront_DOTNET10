@@ -1,0 +1,457 @@
+pipeline {
+    agent any
+
+    environment {
+        // Trusted internal test network. Switch to HTTPS and false once TLS is configured.
+        // Secret values stay in Jenkins Credentials; only its ID is stored here.
+        MINIO_ENDPOINT = 'http://minio.10.80.1.101.sslip.io'
+        MINIO_ALLOW_HTTP = 'true'
+        MINIO_BUCKET = 'security-reports'
+        MINIO_CREDENTIAL_ID = 'minio-security-reports'
+        MINIO_REGION = 'us-east-1'
+        // Empty = PATH, then standard machine-wide AWS CLI v2 installation.
+        AWS_CLI_PATH = ''
+        APP_DIRECTORY = 'web-portal'
+        IMAGE_NAME = 'accessflow-web'
+        IMAGE_PLATFORM = 'linux/amd64'
+        REGISTRY_HOST = '10.80.1.220:8088'
+        REGISTRY_PROJECT = 'accessflow_web'
+        REGISTRY_CREDENTIAL_ID = 'harbor-login-check-01'
+        OSV_SCANNER = 'C:\\Tools\\osv-scanner\\osv-scanner.exe'
+        TRIVY = 'C:\\Tools\\trivy\\trivy.exe'
+        GITOPS_REPOSITORY_SSH = 'ssh://git@ssh.github.com:443/jeerapan-sketch/WebAPI_DOTNET10.git'
+        GITOPS_CREDENTIAL_ID = 'github-gitops-ssh'
+        GITOPS_BRANCH = 'dev'
+        GITOPS_VALUES_FILE = 'helm/argoCD/accessflow-web/values.yaml'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Registry Configuration') {
+            steps {
+                script {
+                    if (!env.REGISTRY_HOST?.trim()) {
+                        error('REGISTRY_HOST is required')
+                    }
+                    if (!env.REGISTRY_PROJECT?.trim()) {
+                        error('REGISTRY_PROJECT is required')
+                    }
+                    if (!env.REGISTRY_CREDENTIAL_ID?.trim()) {
+                        error('REGISTRY_CREDENTIAL_ID is required')
+                    }
+                    if (!env.GITOPS_REPOSITORY_SSH?.trim()) {
+                        error('GITOPS_REPOSITORY_SSH is required')
+                    }
+                    if (!env.GITOPS_CREDENTIAL_ID?.trim()) {
+                        error('GITOPS_CREDENTIAL_ID is required')
+                    }
+                    if (!env.GITOPS_VALUES_FILE?.trim()) {
+                        error('GITOPS_VALUES_FILE is required')
+                    }
+                }
+
+                bat '''
+                    @where node
+                    @node --version
+                    @where npm.cmd
+                    @call npm.cmd --version
+                    @where docker
+                    @docker version
+                '''
+            }
+        }
+
+        stage('Fetch and Validate Tag') {
+            steps {
+                bat 'git fetch --tags'
+                script {
+                    def tagStatus = bat(
+                        script: '@git describe --tags --exact-match',
+                        returnStatus: true
+                    )
+
+                    if (tagStatus != 0) {
+                        currentBuild.result = 'NOT_BUILT'
+                        error('Current commit is not tagged.')
+                    }
+
+                    def tagName = bat(
+                        script: '@git describe --tags --exact-match',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!(tagName ==~ /^v\d+\.\d+\.\d+-(dev|uat|prod)$/)) {
+                        error("Invalid tag format: ${tagName}. Expected v<major>.<minor>.<patch>-<dev|uat|prod>.")
+                    }
+
+                    env.IMAGE_TAG = tagName
+                    env.DEPLOY_ENV = tagName.substring(tagName.lastIndexOf('-') + 1)
+                    env.REGISTRY_IMAGE = "${env.REGISTRY_HOST}/${env.REGISTRY_PROJECT}/${env.IMAGE_NAME}"
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${tagName}"
+
+                    echo "Image: ${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+                    echo "Registry image: ${env.REGISTRY_IMAGE}:${env.IMAGE_TAG}"
+                    echo "Environment: ${env.DEPLOY_ENV}"
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir("${env.APP_DIRECTORY}") {
+                    bat 'call npm.cmd ci'
+                }
+            }
+        }
+
+        stage('Dependency Scan') {
+            steps {
+                script {
+                    // Unique directory prevents reports from an earlier workspace run being uploaded.
+                    env.OSV_REPORT_DIRECTORY = "security-reports/build-${env.BUILD_NUMBER}-${java.util.UUID.randomUUID()}"
+                    env.SCAN_COMMIT = bat(script: '@git rev-parse HEAD', returnStdout: true).trim()
+                }
+                powershell '''
+& ./scripts/security-reports/Invoke-OsvScan.ps1 -ReportDirectory $env:OSV_REPORT_DIRECTORY
+'''
+            }
+            post {
+                always {
+                    script {
+                        if (env.OSV_REPORT_DIRECTORY && fileExists("${env.OSV_REPORT_DIRECTORY}/manifest.json")) {
+                            try {
+                                archiveArtifacts artifacts: "${env.OSV_REPORT_DIRECTORY}/**", allowEmptyArchive: false
+                            } finally {
+                                // Upload runs even if scanning or Jenkins artifact archiving failed.
+                                timeout(time: 5, unit: 'MINUTES') {
+                                    withCredentials([usernamePassword(
+                                        credentialsId: env.MINIO_CREDENTIAL_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                                    )]) {
+                                        powershell '''
+& ./scripts/security-reports/Publish-MinIOReports.ps1 -ReportDirectory $env:OSV_REPORT_DIRECTORY
+'''
+                                    }
+                                }
+                            }
+                        } else {
+                            error('OSV manifest unavailable; no report upload was possible. Release is blocked.')
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Unit Test and Coverage') {
+            steps {
+                dir("${env.APP_DIRECTORY}") {
+                    bat 'call npm.cmd run test:coverage'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'web-portal/coverage/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Type Check') {
+            steps {
+                dir("${env.APP_DIRECTORY}") {
+                    bat 'call npm.cmd run typecheck'
+                }
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                withSonarQubeEnv(
+                        installationName: 'SonarQube-Local',
+                        credentialsId: 'sonar-accessflow-web-token'
+                    ) {
+                    dir("${env.APP_DIRECTORY}") {
+                            bat '''
+                                call npx.cmd @sonar/scan ^
+                                    -Dsonar.host.url="%SONAR_HOST_URL%" ^
+                                    -Dsonar.token="%SONAR_AUTH_TOKEN%" ^
+                                    -Dsonar.projectVersion="%IMAGE_TAG%"
+                            '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Nuxt') {
+            steps {
+                dir("${env.APP_DIRECTORY}") {
+                    bat 'call npm.cmd run build'
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                bat '''
+                    docker build --pull --no-cache ^
+                        --platform "%IMAGE_PLATFORM%" --provenance=false ^
+                        --file "%APP_DIRECTORY%/Dockerfile" ^
+                        --tag "%IMAGE_NAME%:%IMAGE_TAG%" ^
+                        "%APP_DIRECTORY%"
+                '''
+            }
+        }
+
+        stage('Verify Node Runtime') {
+            steps {
+                bat 'docker run --rm --entrypoint node "%IMAGE_NAME%:%IMAGE_TAG%" --version'
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                bat '''
+                    "%TRIVY%" image ^
+                        --severity HIGH,CRITICAL ^
+                        --exit-code 1 ^
+                        "%IMAGE_NAME%:%IMAGE_TAG%"
+                '''
+            }
+        }
+
+        stage('Publish Report Trivy') {
+            steps {
+                bat '''
+                    "%TRIVY%" image ^
+                        --severity HIGH,CRITICAL ^
+                        --format table ^
+                        --output trivy-web-report.txt ^
+                        "%IMAGE_NAME%:%IMAGE_TAG%"
+                '''
+
+                powershell '''
+$content = Get-Content -Path "trivy-web-report.txt" -Raw
+$encoded = [System.Net.WebUtility]::HtmlEncode($content)
+
+$html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Trivy Security Report - AccessFlow Web</title>
+</head>
+<body>
+  <h1>Trivy Security Report - AccessFlow Web</h1>
+  <pre>$encoded</pre>
+</body>
+</html>
+"@
+
+$html | Out-File -FilePath "trivy-web-report.html" -Encoding utf8
+'''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-web-report.txt,trivy-web-report.html', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Verify Docker Image') {
+            steps {
+                bat 'docker images "%IMAGE_NAME%:%IMAGE_TAG%"'
+            }
+        }
+
+        stage('Login Registry') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.REGISTRY_CREDENTIAL_ID,
+                    usernameVariable: 'REGISTRY_USERNAME',
+                    passwordVariable: 'REGISTRY_PASSWORD'
+                )]) {
+                    powershell '''
+$ErrorActionPreference = 'Stop'
+
+foreach ($name in @('REGISTRY_HOST', 'REGISTRY_USERNAME', 'REGISTRY_PASSWORD')) {
+    if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name))) {
+        throw "$name is empty"
+    }
+}
+
+# Quote native Windows arguments without invoking a shell.
+function ConvertTo-NativeArgument([string]$Value) {
+    return '"' + (($Value -replace '(\\\\*)"', '$1$1\\"') -replace '(\\\\+)$', '$1$1') + '"'
+}
+
+$dockerExecutable = (Get-Command docker.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+$startInfo.FileName = $dockerExecutable
+$startInfo.Arguments = 'login --password-stdin --username ' +
+    (ConvertTo-NativeArgument $env:REGISTRY_USERNAME) + ' ' +
+    (ConvertTo-NativeArgument $env:REGISTRY_HOST)
+$startInfo.UseShellExecute = $false
+$startInfo.CreateNoWindow = $true
+$startInfo.RedirectStandardInput = $true
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+$startInfo.EnvironmentVariables.Remove('REGISTRY_PASSWORD')
+
+$process = New-Object System.Diagnostics.Process
+$process.StartInfo = $startInfo
+$passwordBytes = [System.Text.Encoding]::UTF8.GetBytes($env:REGISTRY_PASSWORD)
+try {
+    # .NET Framework creates the stdin StreamWriter from Console.InputEncoding.
+    # Its AutoFlush can emit a BOM before our raw bytes, even without WriteLine.
+    # Setting only PowerShell's $OutputEncoding does not control this writer.
+    $originalInputEncoding = [Console]::InputEncoding
+    try {
+        [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+        [void]$process.Start()
+    } finally {
+        [Console]::InputEncoding = $originalInputEncoding
+    }
+    Write-Host 'Docker stdin: UTF-8 without BOM (Windows PowerShell compatible)'
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+
+    # Write exact UTF-8 bytes: no PowerShell pipeline, BOM, or added newline.
+    $process.StandardInput.BaseStream.Write($passwordBytes, 0, $passwordBytes.Length)
+    $process.StandardInput.BaseStream.Flush()
+    $process.StandardInput.Close()
+
+    if (-not $process.WaitForExit(60000)) {
+        $process.Kill()
+        $process.WaitForExit()
+        throw 'Docker login timed out after 60 seconds'
+    }
+
+    $outputText = $stdout.GetAwaiter().GetResult()
+    $errorText = $stderr.GetAwaiter().GetResult()
+    if ($outputText) { Write-Host $outputText.TrimEnd() }
+    if ($errorText) { Write-Host $errorText.TrimEnd() }
+    $loginExitCode = $process.ExitCode
+    Write-Host "Docker login exit code: $loginExitCode"
+} finally {
+    [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
+    $process.Dispose()
+}
+
+exit $loginExitCode
+                    '''
+                }
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                powershell '''
+$ErrorActionPreference = 'Stop'
+
+try {
+    docker tag `
+        "$env:IMAGE_NAME`:$env:IMAGE_TAG" `
+        "$env:REGISTRY_IMAGE`:$env:IMAGE_TAG"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    docker push "$env:REGISTRY_IMAGE`:$env:IMAGE_TAG"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    docker tag `
+        "$env:REGISTRY_IMAGE`:$env:IMAGE_TAG" `
+        "$env:REGISTRY_IMAGE`:latest"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    docker push "$env:REGISTRY_IMAGE`:latest"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+finally {
+    docker logout $env:REGISTRY_HOST
+}
+'''
+            }
+        }
+
+        stage('Validate Helm Chart') {
+            steps {
+                bat 'helm lint helm/argoCD/accessflow-web'
+            }
+        }
+
+        stage('Update GitOps Image') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: env.GITOPS_CREDENTIAL_ID,
+                    keyFileVariable: 'GITOPS_SSH_KEY',
+                    usernameVariable: 'GITOPS_SSH_USERNAME'
+                )]) {
+                    powershell '''
+$ErrorActionPreference = 'Stop'
+
+$env:GIT_SSH_COMMAND = "ssh -i `"$env:GITOPS_SSH_KEY`" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new"
+
+git remote set-url origin $env:GITOPS_REPOSITORY_SSH
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git fetch origin $env:GITOPS_BRANCH
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git checkout -B gitops-web-image-update "origin/$env:GITOPS_BRANCH"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$valuesPath = $env:GITOPS_VALUES_FILE
+$content = Get-Content -LiteralPath $valuesPath -Raw
+$content = $content -replace '(?m)^(\\s*repository:\\s*).+$', "`${1}$env:REGISTRY_IMAGE"
+$content = $content -replace '(?m)^(\\s*tag:\\s*).+$', "`${1}$env:IMAGE_TAG"
+[System.IO.File]::WriteAllText(
+    (Resolve-Path -LiteralPath $valuesPath),
+    $content,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+git diff -- $valuesPath
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git add -- $valuesPath
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git diff --cached --quiet
+if ($LASTEXITCODE -eq 0) {
+    Write-Host 'GitOps web image values already match the published image.'
+    exit 0
+}
+if ($LASTEXITCODE -ne 1) { exit $LASTEXITCODE }
+
+git config user.name 'Jenkins CI'
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git config user.email 'jenkins-ci@localhost'
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git commit -m "chore(gitops): deploy web $env:IMAGE_TAG [skip ci]"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+git push origin "HEAD:$env:GITOPS_BRANCH"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+'''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'AccessFlow Web image published and GitOps manifest updated successfully.'
+        }
+        failure {
+            echo 'AccessFlow Web CI/GitOps pipeline failed.'
+        }
+    }
+}

@@ -1,0 +1,6 @@
+replicaCount: 1
+ingress:
+  host: dev.accessflow.local
+redis:
+  serviceType: NodePort
+  nodePort: 30379

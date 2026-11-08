@@ -1,0 +1,83 @@
+pipeline {
+    agent any // Requires a Windows agent with access to Linux Docker containers.
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 35, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+    parameters {
+        choice(name: 'TEST_TYPE', choices: ['smoke', 'load'], description: 'Start with smoke before load.')
+        choice(name: 'VUS', choices: ['10', '50', '200'], description: 'Load VUs; smoke uses one. Requires distinct accounts for every VU.')
+        choice(name: 'WORKLOAD', choices: ['business', 'policy'], description: 'business reads Oracle Abatement data; policy only checks authorization.')
+        string(name: 'BASE_URL', defaultValue: 'http://webimportexcel-dev.10.80.1.101.sslip.io', description: 'Backend API origin')
+        string(name: 'ACCOUNTS_CREDENTIAL_ID', defaultValue: 'accessflow-k6-accounts-10', description: 'Jenkins Secret file containing account JSON; select 50/200 account file when increasing VUs.')
+        string(name: 'API_KEY_CREDENTIAL_ID', defaultValue: 'accessflow-k6-api-key', description: 'Jenkins Secret text; required for business workload.')
+        string(name: 'API_KEY_HEADER', defaultValue: 'APIKEY', description: 'Must match backend Config.HeaderKey')
+        string(name: 'ABATEMENT_CODES', defaultValue: '', description: 'Comma-separated real readable Abatement codes; required for business workload.')
+    }
+    environment { K6_IMAGE = 'grafana/k6:1.6.1' }
+    stages {
+        stage('Validate configuration') {
+            steps {
+                script {
+                    if (params.WORKLOAD == 'business' && !params.ABATEMENT_CODES.trim()) {
+                        error('Provide real ABATEMENT_CODES for the business workload.')
+                    }
+                }
+                powershell '''
+$ErrorActionPreference = 'Stop'
+$target = $env:BASE_URL
+$parsedUri = $null
+if ([string]::IsNullOrWhiteSpace($target) -or
+    $target -ne $target.Trim() -or
+    $target -match '\\s' -or
+    ![Uri]::TryCreate($target, [UriKind]::Absolute, [ref]$parsedUri)) {
+    throw 'BASE_URL must be a valid HTTP(S) origin without whitespace.'
+}
+if ($parsedUri.Scheme -notin @('http', 'https') -or
+    !$parsedUri.Host -or $parsedUri.UserInfo -or $parsedUri.Query -or
+    $parsedUri.Fragment -or $parsedUri.AbsolutePath -ne '/') {
+    throw 'BASE_URL must be an HTTP(S) origin without credentials, path or query.'
+}
+'''
+                bat '@docker version'
+            }
+        }
+        stage('Prepare k6') {
+            steps {
+                bat '@docker pull %K6_IMAGE%'
+                powershell '''
+$report = Join-Path $env:WORKSPACE 'performance-report'
+New-Item -ItemType Directory -Path $report -Force | Out-Null
+$summary = Join-Path $report 'summary.json'
+if (Test-Path -LiteralPath $summary) { Remove-Item -LiteralPath $summary }
+'''
+            }
+        }
+        stage('Run performance test') {
+            steps {
+                script {
+                    def runTest = {
+                        powershell '''
+$ErrorActionPreference = 'Stop'
+$scriptPath = '/work/scripts/k6/' + $env:TEST_TYPE + '.js'
+docker run --rm --mount "type=bind,source=$env:WORKSPACE,target=/work" --mount "type=bind,source=$env:K6_ACCOUNTS_SECRET,target=/run/secrets/accounts.json,readonly" -w /work -e BASE_URL -e VUS -e WORKLOAD -e API_KEY -e API_KEY_HEADER -e ABATEMENT_CODES $env:K6_IMAGE run $scriptPath
+if ($LASTEXITCODE -ne 0) { throw "k6 failed with exit code $LASTEXITCODE" }
+$summaryPath = Join-Path $env:WORKSPACE 'performance-report/summary.json'
+if (!(Test-Path -LiteralPath $summaryPath)) { throw 'k6 summary is missing' }
+$summary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
+if ($summary.passed -ne $true) { throw 'Performance thresholds failed' }
+'''
+                    }
+                    withCredentials([file(credentialsId: params.ACCOUNTS_CREDENTIAL_ID, variable: 'K6_ACCOUNTS_SECRET')]) {
+                        if (params.WORKLOAD == 'business') {
+                            withCredentials([string(credentialsId: params.API_KEY_CREDENTIAL_ID, variable: 'API_KEY')]) { runTest() }
+                        } else { withEnv(['API_KEY=']) { runTest() } }
+                    }
+                }
+            }
+        }
+    }
+    post { always { archiveArtifacts(artifacts: 'performance-report/summary.json', allowEmptyArchive: true) } }
+}

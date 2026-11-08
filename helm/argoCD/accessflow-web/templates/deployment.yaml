@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: accessflow-web
+  labels:
+    app: accessflow-web
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | quote }}
+    app.kubernetes.io/name: accessflow-web
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: accessflow-web
+  template:
+    metadata:
+      annotations:
+        pipeline/build-number: {{ .Values.rolloutRevision | quote }}
+      labels:
+        app: accessflow-web
+        app.kubernetes.io/name: accessflow-web
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: accessflow-web
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: NITRO_HOST
+              value: 0.0.0.0
+            - name: NITRO_PORT
+              value: {{ .Values.service.targetPort | quote }}
+            - name: NUXT_PUBLIC_API_BASE
+              value: /backend
+            - name: NUXT_API_PROXY_TARGET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret.name | quote }}
+                  key: {{ .Values.existingSecret.apiProxyTargetKey | quote }}
+            - name: NUXT_REDIS_URL
+              value: "redis://{{ .Values.redis.serviceName }}:{{ .Values.redis.port }}"
+            - name: NUXT_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret.name | quote }}
+                  key: {{ .Values.existingSecret.redisPasswordKey | quote }}
+            - name: NUXT_SESSION_COOKIE_NAME
+              value: {{ .Values.session.cookieName | quote }}
+            - name: NUXT_SESSION_COOKIE_SECURE
+              value: {{ .Values.session.cookieSecure | quote }}
+            - name: NUXT_SESSION_IDLE_SECONDS
+              value: {{ .Values.session.idleSeconds | quote }}
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

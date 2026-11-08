@@ -1,0 +1,14 @@
+# Temporary risk acceptance approved on 2026-10-05.
+# Expires at the end of 2026-10-12 in Asia/Bangkok; do not renew automatically.
+# Upgrade affected dependencies and remove these entries when fixes are published.
+# Only these advisory IDs (and their aliases) are excluded, not entire packages.
+
+[[IgnoredVulns]]
+id = "GHSA-vfj7-8cjw-p6xm"
+ignoreUntil = 2026-10-13T00:00:00+07:00
+reason = "Temporary acceptance for braces 3.0.3, pulled in by Nitro/globby/fast-glob/micromatch. No fixed npm release was available on 2026-10-05. Review https://github.com/micromatch/braces/issues/73 before expiry."
+
+[[IgnoredVulns]]
+id = "GHSA-86w9-cpqp-85rv"
+ignoreUntil = 2026-10-13T00:00:00+07:00
+reason = "Temporary acceptance for node-forge 1.4.0, pulled in by Nuxt/Nitro via listhen and by @sonar/scan. No fixed npm release was available on 2026-10-05. Review https://github.com/digitalbazaar/forge/pull/1152 before expiry."
